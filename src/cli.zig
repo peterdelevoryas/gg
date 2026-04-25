@@ -17,7 +17,7 @@ pub const Command = union(enum) {
     view: ProblemArgs,
     open: ProblemArgs,
     edit: EditArgs,
-    run: RunArgs,
+    prelim_test: TestArgs,
     submit: ProblemArgs,
     help,
 };
@@ -32,7 +32,7 @@ pub const EditArgs = struct {
     no_editor: bool = false,
 };
 
-pub const RunArgs = struct {
+pub const TestArgs = struct {
     problem: []const u8,
     input: ?[]const u8 = null,
 };
@@ -77,7 +77,7 @@ pub fn run(
         .view => |view_args| try app.view(view_args),
         .open => |open_args| try app.open(open_args),
         .edit => |edit_args| try app.edit(edit_args),
-        .run => |run_args| try app.runRemote(run_args),
+        .prelim_test => |test_args| try app.testRemote(test_args),
         .submit => |submit_args| try app.submit(submit_args),
         .help => unreachable,
     }
@@ -178,7 +178,7 @@ const App = struct {
         }
     }
 
-    fn runRemote(self: App, args: RunArgs) !void {
+    fn testRemote(self: App, args: TestArgs) !void {
         const problem = try self.resolveProblem(args.problem);
         const detail = try self.problemDetail(problem);
         const project = try workspace.ensureProblemProject(
@@ -188,7 +188,7 @@ const App = struct {
             problem,
             detail,
         );
-        const input = args.input orelse detail.sample_test_case;
+        const input = preliminaryInput(args, detail);
         if (input.len == 0) return error.MissingInput;
         const local_code = try std.Io.Dir.cwd().readFileAlloc(self.io, project.solution_path, self.allocator, .limited(8 * 1024 * 1024));
         const code = workspace.stripSolutionPrelude(local_code);
@@ -286,8 +286,8 @@ pub fn parseArgs(args: []const []const u8) !Cli {
         } else if (std.mem.eql(u8, arg, "edit")) {
             cli.command = try parseEdit(args[i + 1 ..]);
             return cli;
-        } else if (std.mem.eql(u8, arg, "run")) {
-            cli.command = try parseRun(args[i + 1 ..]);
+        } else if (std.mem.eql(u8, arg, "test")) {
+            cli.command = try parseTest(args[i + 1 ..]);
             return cli;
         } else if (std.mem.eql(u8, arg, "submit")) {
             cli.command = try parseSubmit(args[i + 1 ..]);
@@ -345,7 +345,7 @@ fn parseEdit(args: []const []const u8) !Command {
     return .{ .edit = .{ .problem = problem orelse return error.MissingProblem, .no_editor = no_editor } };
 }
 
-fn parseRun(args: []const []const u8) !Command {
+fn parseTest(args: []const []const u8) !Command {
     var problem: ?[]const u8 = null;
     var input: ?[]const u8 = null;
     var i: usize = 0;
@@ -362,7 +362,7 @@ fn parseRun(args: []const []const u8) !Command {
             return error.TooManyArguments;
         }
     }
-    return .{ .run = .{ .problem = problem orelse return error.MissingProblem, .input = input } };
+    return .{ .prelim_test = .{ .problem = problem orelse return error.MissingProblem, .input = input } };
 }
 
 fn parseSubmit(args: []const []const u8) !Command {
@@ -378,6 +378,14 @@ fn findProblem(problems: []const model.ProblemSummary, query: []const u8) ?model
         }
     }
     return null;
+}
+
+fn preliminaryInput(args: TestArgs, detail: model.ProblemDetail) []const u8 {
+    if (args.input) |input| return input;
+    if (detail.example_testcases) |examples| {
+        if (examples.len != 0) return examples;
+    }
+    return detail.sample_test_case;
 }
 
 fn resolveBrowser(
@@ -659,7 +667,7 @@ fn writeUsage(writer: *std.Io.Writer) !void {
         \\  gg view <id-or-slug>
         \\  gg open <id-or-slug>
         \\  gg edit <id-or-slug> [--no-editor]
-        \\  gg run <id-or-slug> [--input <case>]
+        \\  gg test <id-or-slug> [--input <case>]
         \\  gg submit <id-or-slug>
         \\
         \\Global options:
@@ -698,10 +706,47 @@ test "parses edit no editor" {
     try std.testing.expectEqualStrings("1", parsed.command.edit.problem);
 }
 
-test "parses run input" {
-    const parsed = try parseArgs(&.{ "gg", "run", "two-sum", "--input", "[2,7]\n9" });
-    try std.testing.expect(parsed.command == .run);
-    try std.testing.expectEqualStrings("[2,7]\n9", parsed.command.run.input.?);
+test "parses test input" {
+    const parsed = try parseArgs(&.{ "gg", "test", "two-sum", "--input", "[2,7]\n9" });
+    try std.testing.expect(parsed.command == .prelim_test);
+    try std.testing.expectEqualStrings("[2,7]\n9", parsed.command.prelim_test.input.?);
+}
+
+test "run command is replaced by test" {
+    try std.testing.expectError(error.UnknownCommand, parseArgs(&.{ "gg", "run", "two-sum" }));
+}
+
+test "test defaults to preliminary example testcases" {
+    const detail = model.ProblemDetail{
+        .frontend_id = "1",
+        .question_id = 1,
+        .slug = "two-sum",
+        .title = "Two Sum",
+        .sample_test_case = "[2,7,11,15]\n9",
+        .example_testcases = "[2,7,11,15]\n9\n[3,2,4]\n6\n[3,3]\n6",
+    };
+
+    try std.testing.expectEqualStrings(
+        "[2,7,11,15]\n9\n[3,2,4]\n6\n[3,3]\n6",
+        preliminaryInput(.{ .problem = "two-sum" }, detail),
+    );
+    try std.testing.expectEqualStrings(
+        "[1,2]\n3",
+        preliminaryInput(.{ .problem = "two-sum", .input = "[1,2]\n3" }, detail),
+    );
+
+    const fallback = model.ProblemDetail{
+        .frontend_id = "1",
+        .question_id = 1,
+        .slug = "two-sum",
+        .title = "Two Sum",
+        .sample_test_case = "[2,7,11,15]\n9",
+        .example_testcases = "",
+    };
+    try std.testing.expectEqualStrings(
+        "[2,7,11,15]\n9",
+        preliminaryInput(.{ .problem = "two-sum" }, fallback),
+    );
 }
 
 test "submission code drops local module prelude" {

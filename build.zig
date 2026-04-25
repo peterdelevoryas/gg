@@ -81,6 +81,8 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "gg", .module = mod },
             },
         }),
+        .use_llvm = false,
+        .use_lld = false,
     });
 
     // This declares intent for the executable to be installed into the
@@ -120,6 +122,8 @@ pub fn build(b: *std.Build) void {
     // set the releative field.
     const mod_tests = b.addTest(.{
         .root_module = mod,
+        .use_llvm = false,
+        .use_lld = false,
     });
 
     // A run step that will run the test executable.
@@ -130,6 +134,8 @@ pub fn build(b: *std.Build) void {
     // hence why we have to create two separate ones.
     const exe_tests = b.addTest(.{
         .root_module = exe.root_module,
+        .use_llvm = false,
+        .use_lld = false,
     });
 
     // A run step that will run the second test executable.

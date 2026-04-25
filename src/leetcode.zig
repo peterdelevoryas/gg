@@ -303,10 +303,12 @@ fn renderJudgeResult(
     const w = &out.writer;
     switch (mode) {
         .run => {
+            const status_code = intField(result, "status_code") orelse 0;
+            const status = defaultStatus(stringField(result, "status_msg") orelse "", status_code);
             try w.print(
                 "{s}\nRuntime: {s}\n\nInput: {s}\nOutput: {s}\nExpected: {s}",
                 .{
-                    defaultStatus(stringField(result, "status_msg") orelse "", intField(result, "status_code") orelse 0),
+                    status,
                     blankDash(stringField(result, "status_runtime") orelse ""),
                     blankDash(input),
                     blankDash(firstNonEmpty(result, "code_answer", "code_output")),
@@ -315,15 +317,32 @@ fn renderJudgeResult(
             );
         },
         .submit => {
+            const status_code = intField(result, "status_code") orelse 0;
+            const status = defaultStatus(stringField(result, "status_msg") orelse "", status_code);
             try w.print(
-                "{s}\nProblem: {s}\nRuntime: {s}\nMemory: {s}",
+                "Qualification: {s}\nProblem: {s}",
                 .{
-                    defaultStatus(stringField(result, "status_msg") orelse "", intField(result, "status_code") orelse 0),
+                    status,
                     problem.title,
+                },
+            );
+            if (intField(result, "total_correct")) |correct| {
+                if (intField(result, "total_testcases")) |total| {
+                    try w.print("\nPassed: {d}/{d}", .{ correct, total });
+                }
+            }
+            try w.print(
+                "\nRuntime: {s}\nMemory: {s}",
+                .{
                     blankDash(stringField(result, "status_runtime") orelse ""),
                     blankDash(stringField(result, "status_memory") orelse ""),
                 },
             );
+            if (!isAccepted(status, status_code)) {
+                try writeNonEmptyField(w, "Last Testcase", stringField(result, "last_testcase") orelse "");
+                try writeNonEmptyField(w, "Output", firstNonEmpty(result, "code_answer", "code_output"));
+                try writeNonEmptyField(w, "Expected", firstNonEmpty(result, "expected_code_answer", "expected_output"));
+            }
         },
     }
     if (firstString(result, "std_output")) |stdout| {
@@ -394,6 +413,10 @@ fn firstNonEmpty(value: std.json.Value, a: []const u8, b: []const u8) []const u8
     return "";
 }
 
+fn writeNonEmptyField(w: *std.Io.Writer, label: []const u8, value: []const u8) !void {
+    if (value.len != 0) try w.print("\n{s}: {s}", .{ label, value });
+}
+
 fn parseFrontendId(allocator: std.mem.Allocator, value: std.json.Value) ![]const u8 {
     return switch (value) {
         .integer => |i| std.fmt.allocPrint(allocator, "{d}", .{i}),
@@ -430,6 +453,10 @@ fn defaultStatus(msg: []const u8, code: i64) []const u8 {
         20 => "Compile Error",
         else => "Unknown Result",
     };
+}
+
+fn isAccepted(status: []const u8, code: i64) bool {
+    return code == 10 or std.mem.eql(u8, status, "Accepted");
 }
 
 fn blankDash(s: []const u8) []const u8 {
@@ -482,6 +509,7 @@ test "detail fixture supports codeSnippets and legacy codeDefinition" {
         \\      "titleSlug": "two-sum",
         \\      "content": "<p>x</p>",
         \\      "sampleTestCase": "[2,7]\n9",
+        \\      "exampleTestcases": "[2,7]\n9\n[3,2]\n5",
         \\      "enableRunCode": true,
         \\      "codeSnippets": [
         \\        {"lang":"Rust","langSlug":"rust","code":"impl Solution {}"}
@@ -492,6 +520,8 @@ test "detail fixture supports codeSnippets and legacy codeDefinition" {
     ;
     const detail = try parseProblemDetail(allocator, "two-sum", current);
     try std.testing.expectEqualStrings("impl Solution {}", detail.rustSnippet().?.code);
+    try std.testing.expectEqualStrings("[2,7]\n9", detail.sample_test_case);
+    try std.testing.expectEqualStrings("[2,7]\n9\n[3,2]\n5", detail.example_testcases.?);
 
     const legacy =
         \\{
@@ -509,4 +539,65 @@ test "detail fixture supports codeSnippets and legacy codeDefinition" {
     ;
     const legacy_detail = try parseProblemDetail(allocator, "add-two-numbers", legacy);
     try std.testing.expectEqualStrings("rust", legacy_detail.rustSnippet().?.lang_slug);
+}
+
+test "submit payload uses large qualification judge" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    const problem = model.ProblemSummary{
+        .frontend_id = "1",
+        .question_id = 1,
+        .slug = "two-sum",
+        .title = "Two Sum",
+    };
+    const payload = try renderJudgeStartPayload(allocator, .submit, problem, "impl Solution {}", null);
+    const parsed = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        allocator,
+        payload,
+        .{ .ignore_unknown_fields = true },
+    );
+
+    try std.testing.expectEqualStrings("large", stringField(parsed, "judge_type").?);
+    try std.testing.expect(field(parsed, "data_input") == null);
+}
+
+test "qualification result includes pass count and failing case" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    const problem = model.ProblemSummary{
+        .frontend_id = "1",
+        .question_id = 1,
+        .slug = "two-sum",
+        .title = "Two Sum",
+    };
+    const raw =
+        \\{
+        \\  "state": "SUCCESS",
+        \\  "status_msg": "Wrong Answer",
+        \\  "status_code": 11,
+        \\  "total_correct": 12,
+        \\  "total_testcases": 63,
+        \\  "status_runtime": "0 ms",
+        \\  "status_memory": "2 MB",
+        \\  "last_testcase": "[3,2,4]\\n6",
+        \\  "code_output": "[0,1]",
+        \\  "expected_output": "[1,2]"
+        \\}
+    ;
+    const parsed = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        allocator,
+        raw,
+        .{ .ignore_unknown_fields = true },
+    );
+    const rendered = try renderJudgeResult(allocator, .submit, problem, "", parsed);
+
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "Qualification: Wrong Answer") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "Passed: 12/63") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "Last Testcase: [3,2,4]\\n6") != null);
 }
