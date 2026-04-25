@@ -15,7 +15,8 @@ pub const Cli = struct {
 pub const Command = union(enum) {
     list: ListArgs,
     view: ProblemArgs,
-    open: OpenArgs,
+    open: ProblemArgs,
+    edit: EditArgs,
     run: RunArgs,
     submit: ProblemArgs,
     help,
@@ -26,7 +27,7 @@ pub const ListArgs = struct {
     refresh: bool = false,
 };
 
-pub const OpenArgs = struct {
+pub const EditArgs = struct {
     problem: []const u8,
     no_editor: bool = false,
 };
@@ -75,6 +76,7 @@ pub fn run(
         .list => |list_args| try app.list(list_args),
         .view => |view_args| try app.view(view_args),
         .open => |open_args| try app.open(open_args),
+        .edit => |edit_args| try app.edit(edit_args),
         .run => |run_args| try app.runRemote(run_args),
         .submit => |submit_args| try app.submit(submit_args),
         .help => unreachable,
@@ -129,7 +131,25 @@ const App = struct {
         );
     }
 
-    fn open(self: App, args: OpenArgs) !void {
+    fn open(self: App, args: ProblemArgs) !void {
+        const problem = try self.resolveProblem(args.problem);
+        const problem_url = try self.site.problemUrl(self.allocator, problem.slug);
+
+        if (try resolveBrowser(self.allocator, self.io, self.env)) |browser| {
+            openBrowser(self.allocator, self.io, browser, problem_url) catch |err| {
+                try self.stderr.print("Failed to open browser; URL: {s}\n", .{problem_url});
+                return err;
+            };
+        } else {
+            try self.stderr.print(
+                "No browser configured. Set BROWSER or install xdg-open.\nURL: {s}\n",
+                .{problem_url},
+            );
+            return error.MissingBrowser;
+        }
+    }
+
+    fn edit(self: App, args: EditArgs) !void {
         const problem = try self.resolveProblem(args.problem);
         const detail = try self.problemDetail(problem);
         const project = try workspace.ensureProblemProject(
@@ -149,7 +169,7 @@ const App = struct {
         if (args.no_editor) return;
         const editor = try self.cfg.resolveEditor(self.allocator, self.io, self.env);
         if (editor) |ed| {
-            try launchEditor(self.allocator, self.io, ed, project.solution_path);
+            try launchProgram(self.allocator, self.io, ed, "src/solution.rs", project.dir, error.EditorFailed);
         } else {
             try self.stderr.print(
                 "No editor configured. Set `editor` in {s}, export EDITOR, or install hx.\n",
@@ -170,7 +190,8 @@ const App = struct {
         );
         const input = args.input orelse detail.sample_test_case;
         if (input.len == 0) return error.MissingInput;
-        const code = try std.Io.Dir.cwd().readFileAlloc(self.io, project.solution_path, self.allocator, .limited(8 * 1024 * 1024));
+        const local_code = try std.Io.Dir.cwd().readFileAlloc(self.io, project.solution_path, self.allocator, .limited(8 * 1024 * 1024));
+        const code = workspace.stripSolutionPrelude(local_code);
 
         const auth = try config.resolveAuth(self.cfg, self.env, self.auth_override);
         const client = leetcode.Client.init(self.allocator, self.io, self.site, auth);
@@ -188,7 +209,8 @@ const App = struct {
             problem,
             detail,
         );
-        const code = try std.Io.Dir.cwd().readFileAlloc(self.io, project.solution_path, self.allocator, .limited(8 * 1024 * 1024));
+        const local_code = try std.Io.Dir.cwd().readFileAlloc(self.io, project.solution_path, self.allocator, .limited(8 * 1024 * 1024));
+        const code = workspace.stripSolutionPrelude(local_code);
 
         const auth = try config.resolveAuth(self.cfg, self.env, self.auth_override);
         const client = leetcode.Client.init(self.allocator, self.io, self.site, auth);
@@ -261,6 +283,9 @@ pub fn parseArgs(args: []const []const u8) !Cli {
         } else if (std.mem.eql(u8, arg, "open")) {
             cli.command = try parseOpen(args[i + 1 ..]);
             return cli;
+        } else if (std.mem.eql(u8, arg, "edit")) {
+            cli.command = try parseEdit(args[i + 1 ..]);
+            return cli;
         } else if (std.mem.eql(u8, arg, "run")) {
             cli.command = try parseRun(args[i + 1 ..]);
             return cli;
@@ -298,6 +323,11 @@ fn parseView(args: []const []const u8) !Command {
 }
 
 fn parseOpen(args: []const []const u8) !Command {
+    if (args.len != 1) return error.MissingProblem;
+    return .{ .open = .{ .problem = args[0] } };
+}
+
+fn parseEdit(args: []const []const u8) !Command {
     var problem: ?[]const u8 = null;
     var no_editor = false;
     var i: usize = 0;
@@ -312,7 +342,7 @@ fn parseOpen(args: []const []const u8) !Command {
             return error.TooManyArguments;
         }
     }
-    return .{ .open = .{ .problem = problem orelse return error.MissingProblem, .no_editor = no_editor } };
+    return .{ .edit = .{ .problem = problem orelse return error.MissingProblem, .no_editor = no_editor } };
 }
 
 fn parseRun(args: []const []const u8) !Command {
@@ -350,25 +380,96 @@ fn findProblem(problems: []const model.ProblemSummary, query: []const u8) ?model
     return null;
 }
 
-fn launchEditor(
+fn resolveBrowser(
     allocator: std.mem.Allocator,
     io: std.Io,
-    editor: config.Editor,
-    path: []const u8,
+    env: *const std.process.Environ.Map,
+) !?config.Editor {
+    if (env.get("BROWSER")) |browser_env| {
+        if (try parseProgramEnv(allocator, browser_env)) |browser| return browser;
+    }
+
+    if (try findInPath(allocator, io, env, "xdg-open")) {
+        return .{ .program = "xdg-open", .args = &.{} };
+    }
+    if (try findInPath(allocator, io, env, "open")) {
+        return .{ .program = "open", .args = &.{} };
+    }
+    return null;
+}
+
+fn parseProgramEnv(allocator: std.mem.Allocator, raw: []const u8) !?config.Editor {
+    var parts: std.ArrayList([]const u8) = .empty;
+    var it = std.mem.tokenizeAny(u8, raw, " \t\r\n");
+    while (it.next()) |part| try parts.append(allocator, part);
+    const owned = try parts.toOwnedSlice(allocator);
+    if (owned.len == 0) return null;
+    return .{ .program = owned[0], .args = owned[1..] };
+}
+
+fn findInPath(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    env: *const std.process.Environ.Map,
+    exe: []const u8,
+) !bool {
+    const path = env.get("PATH") orelse return false;
+    var it = std.mem.splitScalar(u8, path, ':');
+    while (it.next()) |dir_raw| {
+        const dir = if (dir_raw.len == 0) "." else dir_raw;
+        const full = try config.pathJoin(allocator, &.{ dir, exe });
+        std.Io.Dir.cwd().access(io, full, .{ .execute = true }) catch |err| switch (err) {
+            error.FileNotFound, error.AccessDenied, error.PermissionDenied => continue,
+            else => |e| return e,
+        };
+        return true;
+    }
+    return false;
+}
+
+fn launchProgram(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    program: config.Editor,
+    argument: []const u8,
+    cwd: ?[]const u8,
+    comptime failure: anyerror,
 ) !void {
     var argv: std.ArrayList([]const u8) = .empty;
-    try argv.append(allocator, editor.program);
-    for (editor.args) |arg| try argv.append(allocator, arg);
-    try argv.append(allocator, path);
+    try argv.append(allocator, program.program);
+    for (program.args) |arg| try argv.append(allocator, arg);
+    try argv.append(allocator, argument);
 
     var child = try std.process.spawn(io, .{
         .argv = argv.items,
+        .cwd = if (cwd) |path| .{ .path = path } else .inherit,
         .stdin = .inherit,
         .stdout = .inherit,
         .stderr = .inherit,
     });
     const term = try child.wait(io);
-    if (term != .exited or term.exited != 0) return error.EditorFailed;
+    if (term != .exited or term.exited != 0) return failure;
+}
+
+fn openBrowser(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    browser: config.Editor,
+    url: []const u8,
+) !void {
+    var argv: std.ArrayList([]const u8) = .empty;
+    try argv.append(allocator, browser.program);
+    for (browser.args) |arg| try argv.append(allocator, arg);
+    try argv.append(allocator, url);
+
+    var child = try std.process.spawn(io, .{
+        .argv = argv.items,
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    });
+    const term = try child.wait(io);
+    if (term != .exited or term.exited != 0) return error.BrowserFailed;
 }
 
 fn statusMarker(status: ?[]const u8) []const u8 {
@@ -556,7 +657,8 @@ fn writeUsage(writer: *std.Io.Writer) !void {
         \\Usage:
         \\  gg list [query] [--refresh]
         \\  gg view <id-or-slug>
-        \\  gg open <id-or-slug> [--no-editor]
+        \\  gg open <id-or-slug>
+        \\  gg edit <id-or-slug> [--no-editor]
         \\  gg run <id-or-slug> [--input <case>]
         \\  gg submit <id-or-slug>
         \\
@@ -577,23 +679,36 @@ test "parses list command with global flags" {
     try std.testing.expectEqualStrings("two", parsed.command.list.query.?);
 }
 
-test "parses open no editor" {
-    const parsed = try parseArgs(&.{ "gg", "open", "1", "--no-editor" });
-    try std.testing.expect(parsed.command == .open);
-    try std.testing.expect(parsed.command.open.no_editor);
-    try std.testing.expectEqualStrings("1", parsed.command.open.problem);
-}
-
 test "parses view command" {
     const parsed = try parseArgs(&.{ "gg", "view", "two-sum" });
     try std.testing.expect(parsed.command == .view);
     try std.testing.expectEqualStrings("two-sum", parsed.command.view.problem);
 }
 
+test "parses open command as browser open" {
+    const parsed = try parseArgs(&.{ "gg", "open", "1" });
+    try std.testing.expect(parsed.command == .open);
+    try std.testing.expectEqualStrings("1", parsed.command.open.problem);
+}
+
+test "parses edit no editor" {
+    const parsed = try parseArgs(&.{ "gg", "edit", "1", "--no-editor" });
+    try std.testing.expect(parsed.command == .edit);
+    try std.testing.expect(parsed.command.edit.no_editor);
+    try std.testing.expectEqualStrings("1", parsed.command.edit.problem);
+}
+
 test "parses run input" {
     const parsed = try parseArgs(&.{ "gg", "run", "two-sum", "--input", "[2,7]\n9" });
     try std.testing.expect(parsed.command == .run);
     try std.testing.expectEqualStrings("[2,7]\n9", parsed.command.run.input.?);
+}
+
+test "submission code drops local module prelude" {
+    try std.testing.expectEqualStrings(
+        "impl Solution {}\n",
+        workspace.stripSolutionPrelude("use super::*;\n\nimpl Solution {}\n"),
+    );
 }
 
 test "renders leetcode html as terminal text" {
